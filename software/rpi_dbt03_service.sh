@@ -5,6 +5,7 @@ cd /usr/local/sbin
 
 BTX_HOST="btx.clarke-3.de"
 BTX_PORT="20000"
+BTX_PROTO="raw"
 
 if [ ! -f rpi_dbt03 ]
 then
@@ -17,6 +18,6 @@ then
 	echo "config file found"
 	source /boot/btx_config.txt
 fi
-echo $BTX_HOST $BTX_PORT
+echo $BTX_HOST $BTX_PORT $BTX_PROTO
 
-./rpi_dbt03 $BTX_HOST $BTX_PORT
+./rpi_dbt03 $BTX_HOST $BTX_PORT $BTX_PROTO

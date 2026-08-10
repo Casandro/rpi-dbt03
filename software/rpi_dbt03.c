@@ -19,10 +19,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <arpa/inet.h> 
+#include <arpa/inet.h>
 
+#include "btx_layer2.h"
 
-#define PIN_LED_BLUE 6 
+#define PIN_LED_BLUE 6
 #define PIN_LED_GREEN 13
 #define PIN_RESET 25
 
@@ -249,7 +250,7 @@ void reset_mcu()
 	printf("done\n");
 }
 
-int handle_socket_to_term(int fd, int sock_fd)
+int handle_socket_to_term(int fd, int sock_fd, int parity7)
 {
 	int status=0;
 	char buf[8];
@@ -263,7 +264,9 @@ int handle_socket_to_term(int fd, int sock_fd)
 		uint8_t res=0;
 		int n;
 		for (n=0; n<l; n++) {
-			status=send_octet(fd, buf[n], &res);
+			uint8_t oct=(uint8_t)buf[n];
+			if (parity7) oct=btx_l2_parity_encode(oct);
+			status=send_octet(fd, oct, &res);
 			if ( ((status>>4)&0x01)==0) {
 				return -1;
 			}
@@ -273,7 +276,7 @@ int handle_socket_to_term(int fd, int sock_fd)
 }
 
 
-int handle_term_to_socket(int fd, int sock_fd)
+int handle_term_to_socket(int fd, int sock_fd, int parity7)
 {
 	uint8_t oct=0;
 	int status=read_octet(fd, &oct);
@@ -282,13 +285,13 @@ int handle_term_to_socket(int fd, int sock_fd)
 	}
 	if (oct!=0xff) {
 		char buf[1];
-		buf[0]=oct;
+		buf[0]=parity7 ? btx_l2_parity_decode(oct) : oct;
 		write(sock_fd, buf, 1);
 	}
 	return 0;
 }
 
-int socket_term_loop(int fd, int sock_fd)
+int socket_term_loop(int fd, int sock_fd, int parity7)
 {
 	int status=0;
 	while (0==0) {
@@ -301,11 +304,93 @@ int socket_term_loop(int fd, int sock_fd)
 			if (((status>>4)&0x01)==0) return -1;
 		}
 		if (bf>8) {
-			status=handle_socket_to_term(fd, sock_fd);
+			status=handle_socket_to_term(fd, sock_fd, parity7);
 			if (status<0) return status;
 		}
-		status=handle_term_to_socket(fd, sock_fd);
+		status=handle_term_to_socket(fd, sock_fd, parity7);
 		if (status<0) return status;
+		usleep(10000);
+	}
+}
+
+/*
+ * Layer-2 mode: the RPi terminates the FTZ 157 D2 exchange side with the
+ * physical terminal (ACK/NAK, retransmission, T.F.I. negotiation) and
+ * bridges pages to/from the raw CEPT byte stream on the IP socket. See
+ * btx_layer2.h. Never combined with 7-bit parity: layer 2 is always 8-bit
+ * clean.
+ */
+int layer2_term_loop(int fd, int sock_fd)
+{
+	btx_l2_bridge g;
+	int flags, status;
+
+	btx_l2_bridge_init(&g);
+	btx_l2_request_tfi(&g.link);
+
+	flags=fcntl(sock_fd, F_GETFL, 0);
+	fcntl(sock_fd, F_SETFL, flags|O_NONBLOCK);
+
+	while (0==0) {
+		int bf=get_free_octets(fd);
+		if (bf<=31) {
+			status=set_mcu_led(fd, 1, 0x3f);
+			if (((status>>4)&0x01)==0) return -1;
+		} else {
+			status=set_mcu_led(fd, 1, 0);
+			if (((status>>4)&0x01)==0) return -1;
+		}
+
+		/* socket -> bridge rx buffer */
+		if (!g.peer_closed) {
+			uint8_t buf[512];
+			size_t space=sizeof(g.rx)-g.rx_len;
+			ssize_t n=space ? recv(sock_fd, buf, space<sizeof(buf) ? space : sizeof(buf), 0) : 0;
+			if (n==0) {
+				g.peer_closed=1;
+				g.linger_ms=BTX_L2_LINGER_MS;
+			} else if (n>0) {
+				memcpy(g.rx+g.rx_len, buf, (size_t)n);
+				g.rx_len+=(size_t)n;
+				g.hold_ms=0;
+			} else if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
+				g.peer_closed=1;
+				g.linger_ms=BTX_L2_LINGER_MS;
+			}
+		}
+
+		/* rx buffer -> link, whenever it is idle and nothing is in flight */
+		btx_l2_bridge_poll(&g);
+
+		/* link -> terminal octets, back-pressured by the AVR's free buffer count */
+		while (bf-->0) {
+			uint8_t b, res=0;
+			if (!btx_l2_tx_byte(&g.link, &b)) break;
+			status=send_octet(fd, b, &res);
+			if (((status>>4)&0x01)==0) return -1;
+		}
+
+		/* terminal -> link, one octet per tick as today */
+		{
+			uint8_t oct=0;
+			status=read_octet(fd, &oct);
+			if (((status>>4)&0x01)==0) return -1;
+			if (oct!=0xff) btx_l2_rx_byte(&g.link, oct);
+		}
+
+		btx_l2_tick(&g.link, 10);
+		btx_l2_bridge_tick(&g, 10);
+
+		/* keystrokes -> socket */
+		if (g.tx_len>0) {
+			ssize_t n=write(sock_fd, g.tx, g.tx_len);
+			if (n>0) {
+				memmove(g.tx, g.tx+n, g.tx_len-(size_t)n);
+				g.tx_len-=(size_t)n;
+			}
+		}
+
+		if (btx_l2_bridge_finished(&g)) return 0;
 		usleep(10000);
 	}
 }
@@ -319,15 +404,16 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	if (argc<3) {
+		printf("Usage: %s <ip> <port> [raw|raw7|layer2]\n", argv[0]);
+		return 1;
+	}
+
 	char c_string[128];
 	char *connection=NULL;
-	
+
 	FILE *cf=fopen("/boot/btx_ip.txt","r");
 	if (cf==NULL) {
-		if (argc!=3) {
-			printf("Usage: %s <ip> <port>\n", argv[0]);
-			return 1;
-		}
 		connection=argv[1];
 	} else {
 		memset(c_string, 0, sizeof(c_string));
@@ -335,6 +421,8 @@ int main(int argc, char *argv[])
 		connection=c_string;
 		fclose(cf);
 	}
+
+	const char *proto=(argc>=4) ? argv[3] : "raw";
 
 	term_start(fd);
 
@@ -346,8 +434,11 @@ int main(int argc, char *argv[])
 
 	term_constart(fd);
 
-	
-	socket_term_loop(fd, sock_fd);
+	if (strcmp(proto, "layer2")==0) {
+		layer2_term_loop(fd, sock_fd);
+	} else {
+		socket_term_loop(fd, sock_fd, strcmp(proto, "raw7")==0);
+	}
 	reset_mcu();
 
 	close(fd);

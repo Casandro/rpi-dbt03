@@ -12,7 +12,14 @@ The boot partition can also hold a `btx_config.txt` file where you can configure
 ```
 BTX_HOST=btx.clarke-3.de
 BTX_PORT=20000
+BTX_PROTO=raw
 ```
+
+`BTX_PROTO` selects the wire protocol spoken with the terminal: `raw`
+(default, transparent octet passthrough), `raw7` (same, but with a 7-bit +
+even-parity transform on every octet), or `layer2` (the host terminates the
+Bildschirmtext layer-2 exchange itself instead of passing octets through
+blindly). See `protocols.txt` for details.
 
 ## Old way of installing it
 
