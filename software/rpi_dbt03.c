@@ -99,8 +99,21 @@ int send_octet(int fd, const int octet, uint8_t *res)
 int get_free_octets(int fd)
 {
 	uint8_t res=0;
+	int free;
 	spi_transfer(fd, 0x06, 0x00, &res);
-	return res&0x7f;
+	/*
+	 * The AVR's ring buffer reserves one slot to tell full from empty
+	 * (write_to_buffer refuses to let write_pointer catch up to
+	 * read_pointer), so real usable capacity is BSIZE-1. But the firmware
+	 * reports BSIZE-buffer_used, which is always exactly one more than
+	 * what can actually be written at every fill level. Asking for that
+	 * many bytes means the last one in every burst gets silently rejected
+	 * by the AVR with nothing here to notice, corrupting whatever block
+	 * was in flight. Correct for the off-by-one here rather than in the
+	 * firmware, since that would need reflashing every deployed board.
+	 */
+	free=(res&0x7f)-1;
+	return free>0 ? free : 0;
 }
 
 int read_octet(int fd, uint8_t *res)
@@ -370,6 +383,7 @@ int layer2_term_loop(int fd, int sock_fd)
 			if (!btx_l2_tx_byte(&g.link, &b)) break;
 			status=send_octet(fd, b, &res);
 			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (octet write)\n"); return -1; }
+			if (res==0xff) { L2_LOG("l2: octet 0x%02x rejected, AVR write buffer full\n", b); return -1; }
 		}
 
 		/* terminal -> link, one octet per tick as today */
