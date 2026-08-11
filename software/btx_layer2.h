@@ -37,6 +37,26 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+/*
+ * Every "l2:" log line is prefixed with a wall-clock timestamp, so a real
+ * hardware run can be checked for how much time actually elapses between
+ * events (e.g. a block going out and its ACK/NAK coming back) rather than
+ * guessing from log order alone.
+ */
+static void l2_log_ts(void)
+{
+	struct timespec ts;
+	struct tm tmv;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	localtime_r(&ts.tv_sec, &tmv);
+	fprintf(stderr, "[%02d:%02d:%02d.%03ld] ", tmv.tm_hour, tmv.tm_min,
+	        tmv.tm_sec, ts.tv_nsec / 1000000);
+}
+
+#define L2_LOG(...) do { l2_log_ts(); fprintf(stderr, __VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------- wire constants */
 
@@ -343,7 +363,7 @@ static void l2_severe_error(btx_l2 *l)
 	static const uint8_t eot = BTX_L2_EOT;
 	size_t i;
 
-	fprintf(stderr,
+	L2_LOG(
 	        "l2: severe error in %s (acked %zu of %zu blocks, abort_reason=%s, responses=[",
 	        btx_l2_state_name(l), l->acked, l->nblocks,
 	        l2_abort_reason_name(l->abort_reason));
@@ -379,7 +399,7 @@ static void l2_load_block(btx_l2 *l)
 	{
 		size_t i;
 
-		fprintf(stderr, "l2: tx block %zu/%zu (%zu bytes):", l->block,
+		L2_LOG("l2: tx block %zu/%zu (%zu bytes):", l->block,
 		        l->nblocks, l->out_len);
 		for (i = 0; i < l->out_len; i++)
 			fprintf(stderr, " %02x", l->out[i]);
@@ -411,12 +431,12 @@ static void l2_start_run(btx_l2 *l, size_t from_block)
 static void l2_retransmit(btx_l2 *l, size_t from_block)
 {
 	if (++l->retransmits > BTX_L2_RETRANSMIT_LIMIT) {
-		fprintf(stderr, "l2: retransmit limit of %d reached\n",
+		L2_LOG("l2: retransmit limit of %d reached\n",
 		        BTX_L2_RETRANSMIT_LIMIT);
 		l2_severe_error(l);
 		return;
 	}
-	fprintf(stderr, "l2: retransmitting from block %zu (attempt %u/%d)\n",
+	L2_LOG("l2: retransmitting from block %zu (attempt %u/%d)\n",
 	        from_block, l->retransmits, BTX_L2_RETRANSMIT_LIMIT);
 	l2_start_run(l, from_block);
 }
@@ -425,12 +445,12 @@ static void l2_send_enq(btx_l2 *l, int reason)
 {
 	static const uint8_t enq = BTX_L2_ENQ;
 
-	fprintf(stderr,
+	L2_LOG(
 	        "l2: sending ENQ, reason=%s (state=%s block=%zu acked=%zu enq_retries=%u)\n",
 	        l2_abort_reason_name(reason), btx_l2_state_name(l), l->block,
 	        l->acked, l->enq_retries + 1);
 	if (++l->enq_retries > BTX_L2_ENQ_RETRY_LIMIT) {
-		fprintf(stderr, "l2: ENQ retry limit of %d reached\n",
+		L2_LOG("l2: ENQ retry limit of %d reached\n",
 		        BTX_L2_ENQ_RETRY_LIMIT);
 		l2_severe_error(l);
 		return;
@@ -511,7 +531,7 @@ static void l2_parse_tfi(btx_l2 *l)
 {
 	size_t i = 0;
 
-	fprintf(stderr, "l2: T.F.I. reply, %zu byte(s):", l->rx_soh_len);
+	L2_LOG("l2: T.F.I. reply, %zu byte(s):", l->rx_soh_len);
 	for (i = 0; i < l->rx_soh_len; i++)
 		fprintf(stderr, " %02x", l->rx_soh_buf[i]);
 	fprintf(stderr, "\n");
@@ -530,7 +550,7 @@ static void l2_parse_tfi(btx_l2 *l)
 		}
 	}
 
-	fprintf(stderr, "l2: T.F.I. applied: use_itb=%d itb_size=%zu\n",
+	L2_LOG("l2: T.F.I. applied: use_itb=%d itb_size=%zu\n",
 	        l->use_itb, l->itb_size);
 
 	l->tfi_done = 1;
@@ -569,7 +589,7 @@ static void btx_l2_rx_byte(btx_l2 *l, uint8_t byte)
 		case BTX_L2_EOT: l2_handle_response(l, BTX_L2_RESP_EOT); return;
 		default:
 			/* Not a sequence we know; treat both bytes as keyboard data. */
-			fprintf(stderr,
+			L2_LOG(
 			        "l2: unrecognized DLE sequence (DLE %02x), treating as keyboard data\n",
 			        byte);
 			l2_notify(l, BTX_L2_EV_KEY, BTX_L2_DLE);
@@ -611,7 +631,7 @@ static void l2_handle_abort_response(btx_l2 *l, btx_l2_resp r)
 	if (l->resp_count < BTX_L2_RESP_QUEUE)
 		l->resp[l->resp_count++] = r;
 
-	fprintf(stderr, "l2: abort-wait resp #%zu = %s (reason=%s)\n",
+	L2_LOG("l2: abort-wait resp #%zu = %s (reason=%s)\n",
 	        l->resp_count, l2_resp_name(r), l2_abort_reason_name(l->abort_reason));
 
 	switch (l->abort_reason) {
@@ -668,7 +688,7 @@ static void l2_handle_abort_response(btx_l2 *l, btx_l2_resp r)
 
 static void l2_handle_response(btx_l2 *l, btx_l2_resp r)
 {
-	fprintf(stderr,
+	L2_LOG(
 	        "l2: rx %s (state=%s block=%zu acked=%zu discard=%d)\n",
 	        l2_resp_name(r), btx_l2_state_name(l), l->block, l->acked,
 	        l->discard_responses);
@@ -808,7 +828,7 @@ static void btx_l2_tick(btx_l2 *l, unsigned ms)
 
 	case BTX_L2_ST_TFI_WAIT:
 		/* No answer in time: basic facilities, 32-byte ITB blocks. */
-		fprintf(stderr,
+		L2_LOG(
 		        "l2: T.F.I. request timed out, using defaults (use_itb=%d itb_size=%zu)\n",
 		        l->use_itb, l->itb_size);
 		l->state = BTX_L2_ST_IDLE;
@@ -995,7 +1015,7 @@ static void btx_l2_bridge_on_event(void *ctx, btx_l2_event ev, uint8_t data)
 			g->tx[g->tx_len++] = data;
 		} else {
 			g->tx_dropped++;
-			fprintf(stderr,
+			L2_LOG(
 			        "l2: keystroke 0x%02x dropped, send queue full (%u lost so far)\n",
 			        data, g->tx_dropped);
 		}
@@ -1010,7 +1030,7 @@ static void btx_l2_bridge_on_event(void *ctx, btx_l2_event ev, uint8_t data)
 		 */
 		if (g->inflight > 0) {
 			if (++g->attempts >= BTX_L2_MAX_ATTEMPTS) {
-				fprintf(stderr,
+				L2_LOG(
 				        "l2: link reset, giving up on %zu bytes after %u tries\n",
 				        g->inflight, g->attempts);
 				g->lost += (unsigned)g->inflight;
@@ -1025,7 +1045,7 @@ static void btx_l2_bridge_on_event(void *ctx, btx_l2_event ev, uint8_t data)
 		break;
 
 	case BTX_L2_EV_PAGE_SENT:
-		fprintf(stderr, "l2: page sent OK (%zu bytes)\n", g->inflight);
+		L2_LOG("l2: page sent OK (%zu bytes)\n", g->inflight);
 		g->attempts = 0;
 		if (g->inflight > 0) {
 			memmove(g->rx, g->rx + g->inflight, g->rx_len - g->inflight);
