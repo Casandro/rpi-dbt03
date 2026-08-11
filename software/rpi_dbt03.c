@@ -355,22 +355,34 @@ int layer2_term_loop(int fd, int sock_fd)
 		}
 
 		/* socket -> bridge rx buffer */
-		if (!g.peer_closed) {
-			uint8_t buf[512];
+		{
 			size_t space=sizeof(g.rx)-g.rx_len;
-			ssize_t n=space ? recv(sock_fd, buf, space<sizeof(buf) ? space : sizeof(buf), 0) : 0;
-			if (n==0) {
-				L2_LOG("l2: server closed the connection (EOF), %zu bytes still queued to terminal\n", g.rx_len);
-				g.peer_closed=1;
-				g.linger_ms=BTX_L2_LINGER_MS;
-			} else if (n>0) {
-				memcpy(g.rx+g.rx_len, buf, (size_t)n);
-				g.rx_len+=(size_t)n;
-				g.hold_ms=0;
-			} else if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
-				L2_LOG("l2: server socket error: %s\n", strerror(errno));
-				g.peer_closed=1;
-				g.linger_ms=BTX_L2_LINGER_MS;
+
+			/*
+			 * space==0 means our own buffer is full, not that the peer is
+			 * gone - a real page can easily be larger than BTX_L2_BUF, and
+			 * it can arrive over TCP in milliseconds, long before the
+			 * multi-second local T.F.I./tone sequence lets any of it drain
+			 * to the terminal. Skipping recv() here used to be conflated
+			 * with recv() itself returning 0 (a genuine EOF), so filling
+			 * the buffer was mistaken for the server hanging up.
+			 */
+			if (!g.peer_closed && space > 0) {
+				uint8_t buf[512];
+				ssize_t n=recv(sock_fd, buf, space<sizeof(buf) ? space : sizeof(buf), 0);
+				if (n==0) {
+					L2_LOG("l2: server closed the connection (EOF), %zu bytes still queued to terminal\n", g.rx_len);
+					g.peer_closed=1;
+					g.linger_ms=BTX_L2_LINGER_MS;
+				} else if (n>0) {
+					memcpy(g.rx+g.rx_len, buf, (size_t)n);
+					g.rx_len+=(size_t)n;
+					g.hold_ms=0;
+				} else if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
+					L2_LOG("l2: server socket error: %s\n", strerror(errno));
+					g.peer_closed=1;
+					g.linger_ms=BTX_L2_LINGER_MS;
+				}
 			}
 		}
 
