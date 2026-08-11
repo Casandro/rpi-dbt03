@@ -348,10 +348,10 @@ int layer2_term_loop(int fd, int sock_fd)
 		int bf=get_free_octets(fd);
 		if (bf<=31) {
 			status=set_mcu_led(fd, 1, 0x3f);
-			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (LED write, bf<=31)\n"); return -1; }
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: terminal disconnected (S went low, LED write bf<=31)\n"); return -1; }
 		} else {
 			status=set_mcu_led(fd, 1, 0);
-			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (LED write, bf>31)\n"); return -1; }
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: terminal disconnected (S went low, LED write bf>31)\n"); return -1; }
 		}
 
 		/* socket -> bridge rx buffer */
@@ -393,7 +393,7 @@ int layer2_term_loop(int fd, int sock_fd)
 			uint8_t b, res=0;
 			if (!btx_l2_tx_byte(&g.link, &b)) break;
 			status=send_octet(fd, b, &res);
-			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (octet write)\n"); return -1; }
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: terminal disconnected (S went low, octet write)\n"); return -1; }
 			if (res==0xff) { L2_LOG("l2: octet 0x%02x rejected, AVR write buffer full\n", b); return -1; }
 		}
 
@@ -401,7 +401,7 @@ int layer2_term_loop(int fd, int sock_fd)
 		{
 			uint8_t oct=0;
 			status=read_octet(fd, &oct);
-			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (octet read)\n"); return -1; }
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: terminal disconnected (S went low, octet read)\n"); return -1; }
 			if (oct!=0xff) btx_l2_rx_byte(&g.link, oct);
 		}
 
