@@ -67,6 +67,16 @@
 #define BTX_L2_T_FLOWCTRL_MS 3000 /* awaiting an outstanding ITB acknowledgement */
 #define BTX_L2_T_CONTROL_MS 3000  /* awaiting anything while in control mode */
 
+/*
+ * Turnaround gap before a block's own bytes start going out. Empirically
+ * needed on real DBT-03 hardware: without it, bytes for the next block can
+ * reach the terminal while it is still busy sending its ACK/NAK for the
+ * previous one, and it never receives them cleanly. 500ms was the value
+ * confirmed working on real hardware; unconfirmed whether a smaller value
+ * would also do.
+ */
+#define BTX_L2_T_BLOCK_GAP_MS 500
+
 #define BTX_L2_ENQ_RETRY_LIMIT 7
 
 /* --------------------------------------------------------------- framing */
@@ -198,6 +208,7 @@ static const char *l2_resp_name(btx_l2_resp r)
 typedef enum {
 	BTX_L2_ST_IDLE,       /* nothing to send */
 	BTX_L2_ST_TFI_WAIT,   /* SOH ENQ sent, waiting for the identifier */
+	BTX_L2_ST_BLOCK_GAP,  /* block framed, waiting out the turnaround gap */
 	BTX_L2_ST_TEXT,       /* emitting the text of the current block */
 	BTX_L2_ST_GATE,       /* at the gate, needs the previous block's response */
 	BTX_L2_ST_TAIL,       /* emitting the terminator and its two BCC bytes */
@@ -292,6 +303,7 @@ static const char *btx_l2_state_name(const btx_l2 *l)
 	switch (l->state) {
 	case BTX_L2_ST_IDLE: return "idle";
 	case BTX_L2_ST_TFI_WAIT: return "tfi-wait";
+	case BTX_L2_ST_BLOCK_GAP: return "block-gap";
 	case BTX_L2_ST_TEXT: return "text";
 	case BTX_L2_ST_GATE: return "gate";
 	case BTX_L2_ST_TAIL: return "tail";
@@ -361,7 +373,8 @@ static void l2_load_block(btx_l2 *l)
 	                             l->block, flags, l->out, sizeof(l->out));
 	l->out_pos = 0;
 	l->out_gate = l->out_len - 3; /* tail = terminator + 2 BCC bytes */
-	l->state = BTX_L2_ST_TEXT;
+	l->state = BTX_L2_ST_BLOCK_GAP;
+	l->timer_ms = BTX_L2_T_BLOCK_GAP_MS;
 
 	{
 		size_t i;
@@ -705,7 +718,14 @@ static void l2_handle_response(btx_l2 *l, btx_l2_resp r)
 			return;
 		}
 		l->acked++;
-		l->timer_ms = 0;
+		/*
+		 * Only cancel the timer if it is actually the GATE flow-control
+		 * wait this ack satisfies. In TEXT or BLOCK_GAP, timer_ms (if
+		 * running at all) belongs to something unrelated to this ack
+		 * (the block-gap countdown), and must not be stomped on.
+		 */
+		if (l->state == BTX_L2_ST_GATE)
+			l->timer_ms = 0;
 		return;
 
 	case BTX_L2_RESP_NAK:
@@ -782,6 +802,10 @@ static void btx_l2_tick(btx_l2 *l, unsigned ms)
 	l->timer_ms = 0;
 
 	switch (l->state) {
+	case BTX_L2_ST_BLOCK_GAP:
+		l->state = BTX_L2_ST_TEXT;
+		return;
+
 	case BTX_L2_ST_TFI_WAIT:
 		/* No answer in time: basic facilities, 32-byte ITB blocks. */
 		fprintf(stderr,

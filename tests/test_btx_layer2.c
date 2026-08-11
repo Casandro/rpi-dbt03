@@ -97,8 +97,35 @@ static void fx_init(fixture *f)
 	btx_l2_init(&f->link, on_event, f);
 }
 
-/* Drain everything the exchange wants to send right now. */
+/*
+ * Drain everything the exchange wants to send right now. The block-gap wait
+ * is a purely internal pacing delay that always resolves on its own (unlike
+ * GATE/FINAL_WAIT/ABORT_WAIT, which wait on a response the test controls),
+ * so pump() fast-forwards through it rather than making every test do so.
+ */
 static size_t pump(fixture *f)
+{
+	uint8_t b;
+	size_t before=f->tx_len;
+
+	for (;;) {
+		if (f->link.state==BTX_L2_ST_BLOCK_GAP)
+			btx_l2_tick(&f->link, BTX_L2_T_BLOCK_GAP_MS);
+		if (btx_l2_tx_byte(&f->link, &b)!=1)
+			break;
+		if (f->tx_len<sizeof(f->tx))
+			f->tx[f->tx_len++]=b;
+		else
+			break;
+	}
+	return f->tx_len-before;
+}
+
+/*
+ * Like pump(), but does NOT fast-forward through BLOCK_GAP: used to catch
+ * the link paused mid-gap, so a test can inject a response right there.
+ */
+static size_t raw_drain(fixture *f)
 {
 	uint8_t b;
 	size_t before=f->tx_len;
@@ -728,6 +755,43 @@ static void test_ack_parity_alternates(void)
 	CHECK_EQ_UINT(f.severe, 0);
 }
 
+static void test_ack_during_block_gap(void)
+{
+	fixture f;
+	uint8_t page[40]; /* > itb_size(32), so block 1 exists and has its own gap */
+
+	fx_init(&f);
+	make_page(page, sizeof(page));
+	CHECK_EQ_UINT(btx_l2_send_page(&f.link, page, sizeof(page)), 0);
+
+	/* Block 0 starts in its own gap; skip only that one to get it sending. */
+	CHECK_EQ_UINT(f.link.state, BTX_L2_ST_BLOCK_GAP);
+	btx_l2_tick(&f.link, BTX_L2_T_BLOCK_GAP_MS);
+	raw_drain(&f);
+
+	/* Block 0 is fully sent; block 1 should now be waiting out its own gap. */
+	CHECK_EQ_UINT(f.link.state, BTX_L2_ST_BLOCK_GAP);
+	CHECK_EQ_UINT(f.link.timer_ms, BTX_L2_T_BLOCK_GAP_MS);
+
+	/* The terminal's ACK for block 0 arrives early, before the gap elapses. */
+	rx_ack(&f);
+
+	/* Must not cancel the still-running block-gap timer: an early ack used
+	 * to zero the shared timer_ms here, which left the link stuck in
+	 * BLOCK_GAP forever since nothing else would ever advance it. */
+	CHECK_EQ_UINT(f.link.state, BTX_L2_ST_BLOCK_GAP);
+	CHECK_EQ_UINT(f.link.timer_ms, BTX_L2_T_BLOCK_GAP_MS);
+
+	/* Once the gap actually elapses, the link must still make progress. */
+	btx_l2_tick(&f.link, BTX_L2_T_BLOCK_GAP_MS);
+	CHECK_EQ_UINT(f.link.state, BTX_L2_ST_TEXT);
+	raw_drain(&f);
+	rx_ack1(&f);
+
+	CHECK_EQ_UINT(f.page_sent, 1);
+	CHECK_EQ_UINT(f.severe, 0);
+}
+
 /* ------------------------------------------------------------ bridge tests */
 
 #define LIMIT 256
@@ -1028,6 +1092,7 @@ int main(void)
 	test_tfi_no_itb_mode();
 	test_single_block_page();
 	test_ack_parity_alternates();
+	test_ack_during_block_gap();
 
 	test_plain_text_cuts_anywhere();
 	test_sequences_are_not_split();
