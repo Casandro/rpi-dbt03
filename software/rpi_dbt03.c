@@ -401,6 +401,12 @@ int layer2_term_loop(int fd, int sock_fd)
 		if (g.tx_len>0) {
 			ssize_t n=write(sock_fd, g.tx, g.tx_len);
 			if (n>0) {
+				size_t i;
+
+				L2_LOG("l2: tx to server (%zd bytes):", n);
+				for (i=0; i<(size_t)n; i++)
+					fprintf(stderr, " %02x", g.tx[i]);
+				fprintf(stderr, "\n");
 				memmove(g.tx, g.tx+n, g.tx_len-(size_t)n);
 				g.tx_len-=(size_t)n;
 			}

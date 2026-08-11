@@ -594,6 +594,8 @@ static void btx_l2_rx_byte(btx_l2 *l, uint8_t byte)
 	case BTX_L2_EOT: l2_handle_response(l, BTX_L2_RESP_EOT); return;
 	default:
 		/* Unframed keyboard data, which may arrive at any moment. */
+		L2_LOG("l2: rx keyboard byte 0x%02x (state=%s)\n", byte,
+		        btx_l2_state_name(l));
 		l2_notify(l, BTX_L2_EV_KEY, byte);
 		return;
 	}
