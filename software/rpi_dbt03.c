@@ -335,10 +335,10 @@ int layer2_term_loop(int fd, int sock_fd)
 		int bf=get_free_octets(fd);
 		if (bf<=31) {
 			status=set_mcu_led(fd, 1, 0x3f);
-			if (((status>>4)&0x01)==0) return -1;
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (LED write, bf<=31)\n"); return -1; }
 		} else {
 			status=set_mcu_led(fd, 1, 0);
-			if (((status>>4)&0x01)==0) return -1;
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (LED write, bf>31)\n"); return -1; }
 		}
 
 		/* socket -> bridge rx buffer */
@@ -347,6 +347,7 @@ int layer2_term_loop(int fd, int sock_fd)
 			size_t space=sizeof(g.rx)-g.rx_len;
 			ssize_t n=space ? recv(sock_fd, buf, space<sizeof(buf) ? space : sizeof(buf), 0) : 0;
 			if (n==0) {
+				L2_LOG("l2: server closed the connection (EOF), %zu bytes still queued to terminal\n", g.rx_len);
 				g.peer_closed=1;
 				g.linger_ms=BTX_L2_LINGER_MS;
 			} else if (n>0) {
@@ -354,6 +355,7 @@ int layer2_term_loop(int fd, int sock_fd)
 				g.rx_len+=(size_t)n;
 				g.hold_ms=0;
 			} else if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
+				L2_LOG("l2: server socket error: %s\n", strerror(errno));
 				g.peer_closed=1;
 				g.linger_ms=BTX_L2_LINGER_MS;
 			}
@@ -367,14 +369,14 @@ int layer2_term_loop(int fd, int sock_fd)
 			uint8_t b, res=0;
 			if (!btx_l2_tx_byte(&g.link, &b)) break;
 			status=send_octet(fd, b, &res);
-			if (((status>>4)&0x01)==0) return -1;
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (octet write)\n"); return -1; }
 		}
 
 		/* terminal -> link, one octet per tick as today */
 		{
 			uint8_t oct=0;
 			status=read_octet(fd, &oct);
-			if (((status>>4)&0x01)==0) return -1;
+			if (((status>>4)&0x01)==0) { L2_LOG("l2: MCU stopped responding (octet read)\n"); return -1; }
 			if (oct!=0xff) btx_l2_rx_byte(&g.link, oct);
 		}
 
@@ -390,7 +392,10 @@ int layer2_term_loop(int fd, int sock_fd)
 			}
 		}
 
-		if (btx_l2_bridge_finished(&g)) return 0;
+		if (btx_l2_bridge_finished(&g)) {
+			L2_LOG("l2: session finished (peer closed, %u byte(s) lost, %u resend(s))\n", g.lost, g.resends);
+			return 0;
+		}
 		usleep(10000);
 	}
 }
