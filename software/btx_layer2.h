@@ -179,6 +179,20 @@ typedef enum {
 	BTX_L2_RESP_EOT
 } btx_l2_resp;
 
+static const char *l2_resp_name(btx_l2_resp r)
+{
+	switch (r) {
+	case BTX_L2_RESP_ACK: return "ACK";
+	case BTX_L2_RESP_ACK0: return "ACK0";
+	case BTX_L2_RESP_ACK1: return "ACK1";
+	case BTX_L2_RESP_NAK: return "NAK";
+	case BTX_L2_RESP_WACK: return "WACK";
+	case BTX_L2_RESP_ENQ: return "ENQ";
+	case BTX_L2_RESP_EOT: return "EOT";
+	}
+	return "?";
+}
+
 #define BTX_L2_RESP_QUEUE 8
 
 typedef enum {
@@ -261,6 +275,18 @@ enum {
 	L2_ABORT_WACK   /* the terminal asked us to wait */
 };
 
+static const char *l2_abort_reason_name(int reason)
+{
+	switch (reason) {
+	case L2_ABORT_NONE: return "none";
+	case L2_ABORT_NAK: return "nak";
+	case L2_ABORT_TO: return "timeout";
+	case L2_ABORT_FINAL: return "final-timeout";
+	case L2_ABORT_WACK: return "wack";
+	}
+	return "?";
+}
+
 static const char *btx_l2_state_name(const btx_l2 *l)
 {
 	switch (l->state) {
@@ -303,10 +329,15 @@ static void l2_go_idle(btx_l2 *l)
 static void l2_severe_error(btx_l2 *l)
 {
 	static const uint8_t eot = BTX_L2_EOT;
+	size_t i;
 
 	fprintf(stderr,
-	        "l2: severe error in %s (acked %zu of %zu blocks), resetting link\n",
-	        btx_l2_state_name(l), l->acked, l->nblocks);
+	        "l2: severe error in %s (acked %zu of %zu blocks, abort_reason=%s, responses=[",
+	        btx_l2_state_name(l), l->acked, l->nblocks,
+	        l2_abort_reason_name(l->abort_reason));
+	for (i = 0; i < l->resp_count; i++)
+		fprintf(stderr, "%s%s", i ? "," : "", l2_resp_name(l->resp[i]));
+	fprintf(stderr, "]), resetting link\n");
 	l2_emit_ctl(l, &eot, 1);
 	l2_go_idle(l);
 	l2_notify(l, BTX_L2_EV_SEVERE_ERROR, 0);
@@ -331,6 +362,16 @@ static void l2_load_block(btx_l2 *l)
 	l->out_pos = 0;
 	l->out_gate = l->out_len - 3; /* tail = terminator + 2 BCC bytes */
 	l->state = BTX_L2_ST_TEXT;
+
+	{
+		size_t i;
+
+		fprintf(stderr, "l2: tx block %zu/%zu (%zu bytes):", l->block,
+		        l->nblocks, l->out_len);
+		for (i = 0; i < l->out_len; i++)
+			fprintf(stderr, " %02x", l->out[i]);
+		fprintf(stderr, "\n");
+	}
 }
 
 static void l2_start_run(btx_l2 *l, size_t from_block)
@@ -362,6 +403,8 @@ static void l2_retransmit(btx_l2 *l, size_t from_block)
 		l2_severe_error(l);
 		return;
 	}
+	fprintf(stderr, "l2: retransmitting from block %zu (attempt %u/%d)\n",
+	        from_block, l->retransmits, BTX_L2_RETRANSMIT_LIMIT);
 	l2_start_run(l, from_block);
 }
 
@@ -369,6 +412,10 @@ static void l2_send_enq(btx_l2 *l, int reason)
 {
 	static const uint8_t enq = BTX_L2_ENQ;
 
+	fprintf(stderr,
+	        "l2: sending ENQ, reason=%s (state=%s block=%zu acked=%zu enq_retries=%u)\n",
+	        l2_abort_reason_name(reason), btx_l2_state_name(l), l->block,
+	        l->acked, l->enq_retries + 1);
 	if (++l->enq_retries > BTX_L2_ENQ_RETRY_LIMIT) {
 		fprintf(stderr, "l2: ENQ retry limit of %d reached\n",
 		        BTX_L2_ENQ_RETRY_LIMIT);
@@ -451,6 +498,12 @@ static void l2_parse_tfi(btx_l2 *l)
 {
 	size_t i = 0;
 
+	fprintf(stderr, "l2: T.F.I. reply, %zu byte(s):", l->rx_soh_len);
+	for (i = 0; i < l->rx_soh_len; i++)
+		fprintf(stderr, " %02x", l->rx_soh_buf[i]);
+	fprintf(stderr, "\n");
+
+	i = 0;
 	while (i < l->rx_soh_len) {
 		uint8_t c = l->rx_soh_buf[i];
 
@@ -463,6 +516,9 @@ static void l2_parse_tfi(btx_l2 *l)
 			i++; /* a decoder class byte, not acted on */
 		}
 	}
+
+	fprintf(stderr, "l2: T.F.I. applied: use_itb=%d itb_size=%zu\n",
+	        l->use_itb, l->itb_size);
 
 	l->tfi_done = 1;
 	if (l->state == BTX_L2_ST_TFI_WAIT) {
@@ -500,6 +556,9 @@ static void btx_l2_rx_byte(btx_l2 *l, uint8_t byte)
 		case BTX_L2_EOT: l2_handle_response(l, BTX_L2_RESP_EOT); return;
 		default:
 			/* Not a sequence we know; treat both bytes as keyboard data. */
+			fprintf(stderr,
+			        "l2: unrecognized DLE sequence (DLE %02x), treating as keyboard data\n",
+			        byte);
 			l2_notify(l, BTX_L2_EV_KEY, BTX_L2_DLE);
 			l2_notify(l, BTX_L2_EV_KEY, byte);
 			return;
@@ -538,6 +597,9 @@ static void l2_handle_abort_response(btx_l2 *l, btx_l2_resp r)
 {
 	if (l->resp_count < BTX_L2_RESP_QUEUE)
 		l->resp[l->resp_count++] = r;
+
+	fprintf(stderr, "l2: abort-wait resp #%zu = %s (reason=%s)\n",
+	        l->resp_count, l2_resp_name(r), l2_abort_reason_name(l->abort_reason));
 
 	switch (l->abort_reason) {
 	case L2_ABORT_NAK:
@@ -593,6 +655,11 @@ static void l2_handle_abort_response(btx_l2 *l, btx_l2_resp r)
 
 static void l2_handle_response(btx_l2 *l, btx_l2_resp r)
 {
+	fprintf(stderr,
+	        "l2: rx %s (state=%s block=%zu acked=%zu discard=%d)\n",
+	        l2_resp_name(r), btx_l2_state_name(l), l->block, l->acked,
+	        l->discard_responses);
+
 	if (r == BTX_L2_RESP_EOT) {
 		/* The terminal reset the link; whatever we were sending is gone. */
 		l2_go_idle(l);
@@ -717,6 +784,9 @@ static void btx_l2_tick(btx_l2 *l, unsigned ms)
 	switch (l->state) {
 	case BTX_L2_ST_TFI_WAIT:
 		/* No answer in time: basic facilities, 32-byte ITB blocks. */
+		fprintf(stderr,
+		        "l2: T.F.I. request timed out, using defaults (use_itb=%d itb_size=%zu)\n",
+		        l->use_itb, l->itb_size);
 		l->state = BTX_L2_ST_IDLE;
 		l->tfi_done = 1;
 		l2_notify(l, BTX_L2_EV_TFI, 0);
@@ -931,6 +1001,7 @@ static void btx_l2_bridge_on_event(void *ctx, btx_l2_event ev, uint8_t data)
 		break;
 
 	case BTX_L2_EV_PAGE_SENT:
+		fprintf(stderr, "l2: page sent OK (%zu bytes)\n", g->inflight);
 		g->attempts = 0;
 		if (g->inflight > 0) {
 			memmove(g->rx, g->rx + g->inflight, g->rx_len - g->inflight);
