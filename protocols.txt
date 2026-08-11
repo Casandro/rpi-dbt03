@@ -74,10 +74,10 @@ modes, selected by BTX_PROTO in btx_config.txt (see README.md):
 - layer2: the host itself terminates the FTZ 157 D2 layer-2 exchange with
   the terminal (ACK/NAK, retransmission, T.F.I. block-size negotiation)
   instead of passing octets through blindly, and bridges the resulting
-  pages to/from a raw CEPT byte stream on the IP socket, cutting pages at
-  safe presentation-layer boundaries. This covers the "filtering"/"data
-  unit" wishlist above by construction, since the host now understands the
-  block structure of what is on the wire. Always 8-bit clean; not combined
+  pages to/from a raw CEPT byte stream on the IP socket, cut into
+  fixed-size chunks. This covers the "filtering"/"data unit" wishlist
+  above by construction, since the host now understands the block
+  structure of what is on the wire. Always 8-bit clean; not combined
   with raw7's parity transform.
 
 See software/btx_layer2.h for the implementation.

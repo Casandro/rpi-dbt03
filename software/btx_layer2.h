@@ -4,9 +4,14 @@
  * Ported from https://github.com/ (btx_modem_sip project), which implements
  * the FTZ 157 D2 exchange (Btx Zentrale) side that talks to a real DBT-03
  * terminal. This is a single-file merge of that project's btx_proto.h,
- * crc16.{h,c}, btx_frame.{h,c}, btx_link.{h,c} and the chunking/safe-cut half
- * of gateway.{h,c} (the non-blocking-socket half of gateway.c is left out;
- * the caller already owns its own socket).
+ * crc16.{h,c}, btx_frame.{h,c}, btx_link.{h,c} and the chunking half of
+ * gateway.{h,c} (the non-blocking-socket half of gateway.c is left out; the
+ * caller already owns its own socket). gateway.c also cut chunks on
+ * presentation-layer sequence boundaries, justified there by an observation
+ * on a real page rather than a spec citation; simple fixed-size chunking is
+ * used here instead, since nothing in FTZ 157 D2 requires the former and it
+ * added a real bug surface (see git history) for a benefit that may have
+ * been misattributed in the first place.
  *
  * Two layers of API:
  *
@@ -16,8 +21,8 @@
  *                    about sockets or SPI.
  *
  *   btx_l2_bridge_*  cuts a raw byte stream (e.g. from a BTX-over-IP server)
- *                    into pages at safe boundaries and feeds them to the
- *                    embedded btx_l2_bridge.link, resending them if the link
+ *                    into fixed-size pages and feeds them to the embedded
+ *                    btx_l2_bridge.link, resending them if the link
  *                    resets before they are acknowledged. The caller is
  *                    still responsible for actually moving bytes to and from
  *                    a socket; this only manages the buffers in between.
@@ -877,19 +882,17 @@ static inline uint8_t btx_l2_parity_decode(uint8_t b)
  */
 #define BTX_L2_CHUNK 256
 
-/* Enough to hold the chunk going out and the next one being gathered. */
+/*
+ * Only enough to hold the chunk going out and the next one being gathered.
+ * Reading no further than this leaves the rest in the kernel's receive
+ * window, so TCP applies the backpressure and the server simply waits,
+ * rather than us accumulating data the terminal will not see for a while.
+ */
 #define BTX_L2_BUF (2 * BTX_L2_CHUNK)
 #define BTX_L2_TXBUF 256
 
 /* How long to keep draining to the terminal after the server goes, at most. */
 #define BTX_L2_LINGER_MS 15000
-
-/*
- * A server that stops mid-sequence must not leave those bytes stuck here
- * forever, so give up waiting for the rest after this long and send them as
- * they are.
- */
-#define BTX_L2_HOLD_MS 200
 
 /* How many times a page is offered before it is abandoned. */
 #define BTX_L2_MAX_ATTEMPTS 3
@@ -911,10 +914,6 @@ typedef struct {
 	int peer_closed;
 	unsigned linger_ms;
 
-	/* How long the tail of rx has been held back waiting for the rest of a
-	 * presentation-layer sequence. */
-	unsigned hold_ms;
-
 	/* Bytes handed to the link and not yet acknowledged. They stay at the
 	 * front of rx until the page is confirmed, so a link reset can put
 	 * them back on the line instead of losing them. */
@@ -923,64 +922,6 @@ typedef struct {
 	unsigned resends;  /* pages actually sent a second time */
 	unsigned lost;     /* bytes finally given up on */
 } btx_l2_bridge;
-
-/*
- * How long the unit starting at p is, or 0 if it is not all here yet.
- *
- * A page boundary puts ETX BCC EOT STX on the line and resets the link, so a
- * presentation-layer sequence cut in half by that boundary has its
- * parameters arrive after a reset with the introducer left behind. Only the
- * introducers that take following bytes need listing here.
- */
-static size_t l2_unit_len(const uint8_t *p, size_t len)
-{
-	size_t i = 1;
-
-	switch (p[0]) {
-	case 0x1B: /* ESC: intermediates 2/0 to 2/15, then one final byte */
-		while (i < len && p[i] >= 0x20 && p[i] <= 0x2F)
-			i++;
-		return (i < len) ? i + 1 : 0;
-
-	case 0x9B: /* CSI: parameters 3/0 to 3/15, intermediates, final */
-		while (i < len && p[i] >= 0x30 && p[i] <= 0x3F)
-			i++;
-		while (i < len && p[i] >= 0x20 && p[i] <= 0x2F)
-			i++;
-		return (i < len) ? i + 1 : 0;
-
-	case 0x19: /* SS2, the next character comes from G2 */
-	case 0x1D: /* SS3, from G3 */
-	case 0x12: /* REP, a repeat count follows */
-		return (len >= 2) ? 2 : 0;
-
-	case 0x1F: /* APA, a row and a column follow */
-		return (len >= 3) ? 3 : 0;
-
-	default:
-		return 1;
-	}
-}
-
-/*
- * The largest number of bytes not exceeding limit that ends on a boundary
- * between presentation-layer sequences, so a page never ends part way
- * through one. Returns 0 if not even the first sequence is complete.
- */
-static size_t btx_l2_safe_cut(const uint8_t *p, size_t len, size_t limit)
-{
-	size_t at = 0, cut = 0;
-
-	while (at < len) {
-		size_t n = l2_unit_len(p + at, len - at);
-
-		if (n == 0 || at + n > limit)
-			break;
-		at += n;
-		cut = at;
-	}
-	return cut;
-}
 
 static void btx_l2_bridge_on_event(void *ctx, btx_l2_event ev, uint8_t data)
 {
@@ -1051,17 +992,7 @@ static void btx_l2_bridge_poll(btx_l2_bridge *g)
 	if (g->rx_len == 0 || g->inflight > 0 || btx_l2_busy(&g->link))
 		return;
 
-	chunk = btx_l2_safe_cut(g->rx, g->rx_len, BTX_L2_CHUNK);
-	if (chunk == 0) {
-		/* Everything on hand is the front of an incomplete sequence.
-		 * Wait for the rest unless there is no more coming, no room left,
-		 * or it has already been too long. */
-		if (!g->peer_closed && g->rx_len < sizeof(g->rx) &&
-		    g->hold_ms < BTX_L2_HOLD_MS)
-			return;
-		chunk = g->rx_len < BTX_L2_CHUNK ? g->rx_len : BTX_L2_CHUNK;
-	}
-
+	chunk = g->rx_len < BTX_L2_CHUNK ? g->rx_len : BTX_L2_CHUNK;
 	if (btx_l2_send_page(&g->link, g->rx, chunk) != 0)
 		return;
 
@@ -1072,12 +1003,9 @@ static void btx_l2_bridge_poll(btx_l2_bridge *g)
 	g->inflight = chunk;
 }
 
-/* Count down the hold/linger timers. Call once per frame. */
+/* Count down the linger timer. Call once per frame. */
 static void btx_l2_bridge_tick(btx_l2_bridge *g, unsigned ms)
 {
-	if (g->rx_len > 0 && g->inflight == 0)
-		g->hold_ms += ms;
-
 	if (g->linger_ms > ms)
 		g->linger_ms -= ms;
 	else

@@ -377,7 +377,6 @@ int layer2_term_loop(int fd, int sock_fd)
 				} else if (n>0) {
 					memcpy(g.rx+g.rx_len, buf, (size_t)n);
 					g.rx_len+=(size_t)n;
-					g.hold_ms=0;
 				} else if (errno!=EAGAIN && errno!=EWOULDBLOCK) {
 					L2_LOG("l2: server socket error: %s\n", strerror(errno));
 					g.peer_closed=1;

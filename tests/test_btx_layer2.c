@@ -732,133 +732,30 @@ static void test_ack_parity_alternates(void)
 
 #define LIMIT 256
 
-static void test_plain_text_cuts_anywhere(void)
+static void test_poll_cuts_at_chunk_size(void)
 {
-	uint8_t buf[512];
-
-	memset(buf, 'A', sizeof(buf));
-
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, sizeof(buf), LIMIT), LIMIT);
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, 100, LIMIT), 100);
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, 0, LIMIT), 0);
-}
-
-static void test_sequences_are_not_split(void)
-{
-	static const struct {
-		const char *what;
-		uint8_t seq[6];
-		size_t len;
-	} cases[]={
-		{ "ESC 2/3 2/1 4/12", { 0x1B, 0x23, 0x21, 0x4C }, 4 },
-		{ "ESC 6/15", { 0x1B, 0x6F }, 2 },
-		{ "CSI 3/1 4/0", { 0x9B, 0x31, 0x40 }, 3 },
-		{ "APA row col", { 0x1F, 0x52, 0x48 }, 3 },
-		{ "SS2 + char", { 0x19, 0x48 }, 2 },
-		{ "REP + count", { 0x12, 0x45 }, 2 },
-	};
-	size_t c, off;
-
-	for (c=0; c<sizeof(cases)/sizeof(cases[0]); c++) {
-		for (off=LIMIT-cases[c].len+1; off<LIMIT; off++) {
-			uint8_t buf[512];
-			size_t cut;
-
-			memset(buf, 'A', sizeof(buf));
-			memcpy(buf+off, cases[c].seq, cases[c].len);
-			cut=btx_l2_safe_cut(buf, sizeof(buf), LIMIT);
-
-			if (cut!=off)
-				printf("  %s at %zu: cut at %zu, want %zu\n",
-				       cases[c].what, off, cut, off);
-			CHECK_EQ_UINT(cut, off);
-		}
-
-		{
-			uint8_t buf[512];
-
-			memset(buf, 'A', sizeof(buf));
-			memcpy(buf+LIMIT-cases[c].len, cases[c].seq, cases[c].len);
-			CHECK_EQ_UINT(btx_l2_safe_cut(buf, sizeof(buf), LIMIT), LIMIT);
-		}
-	}
-}
-
-static void test_incomplete_tail_is_held_back(void)
-{
-	uint8_t buf[16];
-
-	memset(buf, 'A', sizeof(buf));
-	buf[10]=0x1B;
-	buf[11]=0x23;
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, 12, LIMIT), 10);
-
-	buf[10]=0x1F;
-	buf[11]=0x52;
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, 12, LIMIT), 10);
-
-	buf[12]=0x48;
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf, 13, LIMIT), 13);
-
-	CHECK_EQ_UINT(btx_l2_safe_cut(buf+10, 2, LIMIT), 0);
-}
-
-static void test_cutting_preserves_the_stream(void)
-{
-	uint8_t src[4096], out[4096];
-	size_t n_out=0, at=0, i;
-	uint32_t r=20250808u;
-
-	for (i=0; i<sizeof(src); i++) {
-		r=r*1103515245u+12345u;
-		switch ((r>>16)%8u) {
-		case 0: src[i]=0x1B; break;
-		case 1: src[i]=0x9B; break;
-		case 2: src[i]=0x1F; break;
-		case 3: src[i]=0x12; break;
-		default: src[i]=(uint8_t)(0x20+((r>>8)%0x60u)); break;
-		}
-	}
-
-	while (at<sizeof(src)) {
-		size_t cut=btx_l2_safe_cut(src+at, sizeof(src)-at, LIMIT);
-
-		CHECK(cut<=LIMIT);
-		if (cut==0) {
-			CHECK(sizeof(src)-at<LIMIT);
-			cut=sizeof(src)-at;
-		}
-		memcpy(out+n_out, src+at, cut);
-		n_out+=cut;
-		at+=cut;
-	}
-
-	CHECK_EQ_UINT(n_out, sizeof(src));
-	CHECK(memcmp(out, src, sizeof(src))==0);
-}
-
-static void test_poll_holds_the_real_page_boundary(void)
-{
-	static const uint8_t tail[]={ 0x9B, 0x31, 0x51, 0x1B, 0x23, 0x21, 0x4C };
 	btx_l2_bridge g;
-	size_t off=LIMIT-4;
 
 	btx_l2_bridge_init(&g);
 
+	/* More than one chunk buffered: cut exactly at the chunk size, even
+	 * mid-sequence - there is no other rule to honour. */
 	memset(g.rx, 'A', sizeof(g.rx));
-	memcpy(g.rx+off, tail, sizeof(tail));
+	g.rx[LIMIT]=0x1B; /* the start of an ESC sequence, split by the cut */
 	g.rx_len=sizeof(g.rx);
 
 	btx_l2_bridge_poll(&g);
+	CHECK_EQ_UINT(g.inflight, LIMIT);
 
-	CHECK_EQ_UINT(g.inflight, off+3);
-	CHECK_EQ_UINT(g.rx[g.inflight], 0x1B);
-
-	CHECK_EQ_UINT(g.rx_len, sizeof(g.rx));
 	btx_l2_bridge_on_event(&g, BTX_L2_EV_PAGE_SENT, 0);
-	CHECK_EQ_UINT(g.inflight, 0);
-	CHECK_EQ_UINT(g.rx_len, sizeof(g.rx)-(off+3));
+	CHECK_EQ_UINT(g.rx_len, sizeof(g.rx)-LIMIT);
 	CHECK_EQ_UINT(g.rx[0], 0x1B);
+
+	/* Less than one chunk buffered: take all of it, no waiting. */
+	btx_l2_init(&g.link, btx_l2_bridge_on_event, &g);
+	g.rx_len=10;
+	btx_l2_bridge_poll(&g);
+	CHECK_EQ_UINT(g.inflight, 10);
 }
 
 static void test_aborted_message_is_sent_again(void)
@@ -912,55 +809,6 @@ static void test_aborted_message_is_sent_again(void)
 	CHECK_EQ_UINT(g.attempts, 0);
 }
 
-static void test_hold_timer_releases_a_stalled_tail(void)
-{
-	btx_l2_bridge g;
-
-	btx_l2_bridge_init(&g);
-
-	g.rx[0]=0x1B;
-	g.rx[1]=0x23;
-	g.rx_len=2;
-
-	btx_l2_bridge_poll(&g);
-	CHECK_EQ_UINT(g.inflight, 0);
-	CHECK_EQ_UINT(g.rx_len, 2);
-
-	btx_l2_bridge_tick(&g, BTX_L2_HOLD_MS);
-	btx_l2_bridge_poll(&g);
-	CHECK_EQ_UINT(g.inflight, 2);
-	btx_l2_bridge_on_event(&g, BTX_L2_EV_PAGE_SENT, 0);
-	CHECK_EQ_UINT(g.rx_len, 0);
-}
-
-static void test_hold_timer_pauses_while_a_message_is_in_flight(void)
-{
-	btx_l2_bridge g;
-	size_t sent;
-
-	btx_l2_bridge_init(&g);
-
-	memset(g.rx, 'A', LIMIT+2);
-	g.rx[LIMIT]=0x1B;
-	g.rx[LIMIT+1]=0x23;
-	g.rx_len=LIMIT+2;
-
-	btx_l2_bridge_poll(&g);
-	sent=g.inflight;
-	CHECK_EQ_UINT(sent, LIMIT);
-
-	btx_l2_bridge_tick(&g, BTX_L2_HOLD_MS*5);
-	CHECK_EQ_UINT(g.hold_ms, 0);
-
-	btx_l2_bridge_on_event(&g, BTX_L2_EV_PAGE_SENT, 0);
-	CHECK_EQ_UINT(g.rx_len, 2);
-
-	btx_l2_init(&g.link, btx_l2_bridge_on_event, &g);
-	btx_l2_bridge_poll(&g);
-	CHECK_EQ_UINT(g.inflight, 0);
-	CHECK_EQ_UINT(g.rx_len, 2);
-}
-
 static void test_bridge_finished(void)
 {
 	btx_l2_bridge g;
@@ -976,8 +824,10 @@ static void test_bridge_finished(void)
 	g.rx_len=0;
 	CHECK_EQ_UINT(btx_l2_bridge_finished(&g), 1); /* drained */
 
-	g.linger_ms=0;
+	g.linger_ms=1000;
 	g.rx_len=100;
+	btx_l2_bridge_tick(&g, 1500);
+	CHECK_EQ_UINT(g.linger_ms, 0);
 	CHECK_EQ_UINT(btx_l2_bridge_finished(&g), 1); /* linger expired anyway */
 }
 
@@ -1029,14 +879,8 @@ int main(void)
 	test_single_block_page();
 	test_ack_parity_alternates();
 
-	test_plain_text_cuts_anywhere();
-	test_sequences_are_not_split();
-	test_incomplete_tail_is_held_back();
-	test_cutting_preserves_the_stream();
-	test_poll_holds_the_real_page_boundary();
+	test_poll_cuts_at_chunk_size();
 	test_aborted_message_is_sent_again();
-	test_hold_timer_releases_a_stalled_tail();
-	test_hold_timer_pauses_while_a_message_is_in_flight();
 	test_bridge_finished();
 
 	test_parity_roundtrip();
