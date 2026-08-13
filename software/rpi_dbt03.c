@@ -337,6 +337,7 @@ int layer2_term_loop(int fd, int sock_fd)
 {
 	btx_l2_bridge g;
 	int flags, status;
+	unsigned read_polls=0, read_hits=0, read_report_ms=0;
 
 	btx_l2_bridge_init(&g);
 	btx_l2_request_tfi(&g.link);
@@ -402,7 +403,31 @@ int layer2_term_loop(int fd, int sock_fd)
 			uint8_t oct=0;
 			status=read_octet(fd, &oct);
 			if (((status>>4)&0x01)==0) { L2_LOG("l2: terminal disconnected (S went low, octet read)\n"); return -1; }
-			if (oct!=0xff) btx_l2_rx_byte(&g.link, oct);
+			read_polls++;
+			if (oct!=0xff) {
+				read_hits++;
+				btx_l2_rx_byte(&g.link, oct);
+			}
+		}
+
+		/*
+		 * One poll per 10ms tick is a ceiling of 100 octets/sec, whereas the
+		 * line runs at 1200 bit/s (~120 octets/sec) - so a terminal sending
+		 * flat-out (e.g. a stuck or auto-repeating key) can outrun this read
+		 * side. A hit rate pinned near 100% over a reporting window is that
+		 * happening: every poll finds a byte waiting, meaning the AVR's own
+		 * 32-byte term_to_rpi buffer is the only thing standing between here
+		 * and silently dropped/overwritten input.
+		 */
+		read_report_ms+=10;
+		if (read_report_ms>=1000) {
+			L2_LOG("l2: terminal read: %u/%u polls returned a byte (%u%%) in the last %ums\n",
+			        read_hits, read_polls,
+			        read_polls ? (unsigned)(100u*read_hits/read_polls) : 0u,
+			        read_report_ms);
+			read_polls=0;
+			read_hits=0;
+			read_report_ms=0;
 		}
 
 		btx_l2_tick(&g.link, 10);

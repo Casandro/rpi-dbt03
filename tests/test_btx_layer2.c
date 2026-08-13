@@ -590,6 +590,50 @@ static void test_keyboard_demux(void)
 	check_bytes("keyboard data", f.keys, f.nkeys, want, sizeof(want));
 }
 
+/*
+ * Field report: pressing buttons while a page is loading broke the
+ * transmission. Simulate "mashing buttons" - a long burst of keyboard bytes,
+ * none of them colliding with a reserved layer-2 code point (FTZ 157 D2
+ * Annex 6 reserves 0/1-0/7, 1/0, 1/5-1/7 for layer 2; keyboard/presentation
+ * codes live outside that range) - interleaved with an in-flight, multi-block
+ * page, right at the gate where the exchange is waiting on the previous
+ * block's ACK. The page must still complete normally afterward and every
+ * keystroke must survive, in order.
+ */
+static void test_keyboard_burst_during_page_transmission(void)
+{
+	fixture f;
+	uint8_t page[100];
+	uint8_t want[200];
+	size_t i;
+
+	fx_init(&f);
+	make_page(page, sizeof(page));
+	btx_l2_send_page(&f.link, page, sizeof(page));
+
+	pump(&f); /* block 0 out, block 1's text out, now gated on block 0's ACK */
+
+	for (i=0; i<sizeof(want); i++) {
+		/* Cycle through printable/function codes that stay clear of the
+		 * reserved set - this is what a real keyboard would send. */
+		want[i]=(uint8_t)(0x20+(i%0x60));
+		btx_l2_rx_byte(&f.link, want[i]);
+	}
+
+	rx_ack(&f); /* block 0 */
+	pump(&f);
+	rx_ack(&f); /* block 1 */
+	pump(&f);
+	rx_ack(&f); /* block 2 */
+	pump(&f);
+	rx_ack1(&f); /* final block */
+	pump(&f);
+
+	CHECK_EQ_UINT(f.page_sent, 1);
+	CHECK_EQ_UINT(f.severe, 0);
+	check_bytes("burst keyboard data", f.keys, f.nkeys, want, sizeof(want));
+}
+
 static void test_terminal_eot(void)
 {
 	fixture f;
@@ -831,6 +875,27 @@ static void test_bridge_finished(void)
 	CHECK_EQ_UINT(btx_l2_bridge_finished(&g), 1); /* linger expired anyway */
 }
 
+/*
+ * Same field report as test_keyboard_burst_during_page_transmission, at the
+ * bridge layer: enough keystrokes to overrun the queue toward the server
+ * (BTX_L2_TXBUF bytes) must be dropped and counted, not overflow anything.
+ */
+static void test_bridge_tx_queue_overflow_no_crash(void)
+{
+	btx_l2_bridge g;
+	size_t i, n=BTX_L2_TXBUF+50;
+
+	btx_l2_bridge_init(&g);
+
+	for (i=0; i<n; i++)
+		btx_l2_bridge_on_event(&g, BTX_L2_EV_KEY, (uint8_t)(0x20+(i%0x60)));
+
+	CHECK_EQ_UINT(g.tx_len, BTX_L2_TXBUF);
+	CHECK_EQ_UINT(g.tx_dropped, n-BTX_L2_TXBUF);
+	for (i=0; i<g.tx_len; i++)
+		CHECK_EQ_UINT(g.tx[i], (uint8_t)(0x20+(i%0x60)));
+}
+
 /* ---------------------------------------------------------- parity mode */
 
 static void test_parity_roundtrip(void)
@@ -872,6 +937,7 @@ int main(void)
 	test_too_many_acks_is_severe();
 	test_wack();
 	test_keyboard_demux();
+	test_keyboard_burst_during_page_transmission();
 	test_terminal_eot();
 	test_tfi_negotiation();
 	test_tfi_timeout_uses_defaults();
@@ -882,6 +948,7 @@ int main(void)
 	test_poll_cuts_at_chunk_size();
 	test_aborted_message_is_sent_again();
 	test_bridge_finished();
+	test_bridge_tx_queue_overflow_no_crash();
 
 	test_parity_roundtrip();
 
